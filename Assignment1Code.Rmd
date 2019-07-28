@@ -3,16 +3,35 @@ title: "R Notebook"
 output: html_notebook
 ---
 
-This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
-
-Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
-
 ```{r}
-plot(cars)
+dir.create("data")
+download.file(
+  url = "http://files.grouplens.org/datasets/movielens/ml-latest.zip", 
+  destfile = "data/ml-latest.zip"
+)
+unzip("data/ml-latest.zip", exdir = "data")
 ```
 
-Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+```{r}
+# read in the csv files
+movies <- read.csv("data/ml-latest/movies.csv")  # movie info: title and genre
+ratings <- read.csv("data/ml-latest/ratings.csv") # user ratings for each movie
+tags <- read.csv("data/ml-latest/tags.csv") # additional user reviews ("tag")
+links <- read.csv("data/ml-latest/links.csv") # lookup for imdb movie IDs
 
-When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+# save as .RData
+save(links, movies, ratings, tags, file = "data/movielens-small.RData")
 
-The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+# check that it's worked
+rm(list = ls())
+load("data/movielens.RData")
+```
+
+```{r}
+load("data/movielens.RData")
+```
+
+```{r}
+library(tidyverse)
+```
+
