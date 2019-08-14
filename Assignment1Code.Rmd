@@ -20,11 +20,7 @@ tags <- read.csv("data/ml-latest/tags.csv") # additional user reviews ("tag")
 links <- read.csv("data/ml-latest/links.csv") # lookup for imdb movie IDs
 
 # save as .RData
-save(links, movies, ratings, tags, file = "data/movielens-small.RData")
-
-# check that it's worked
-rm(list = ls())
-load("data/movielens.RData")
+save(links, movies, ratings, tags, file = "data/movielens.RData")
 ```
 
 ```{r}
@@ -35,3 +31,42 @@ load("data/movielens.RData")
 library(tidyverse)
 ```
 
+Looking at the data
+```{r}
+glimpse(ratings)
+```
+
+
+```{r}
+length(unique(ratings$userId))
+unique(ratings$rating)
+length(unique(movies$movieId))
+length(unique(movies$title))
+
+
+#Example of duplicate movies, ie a single movie with two movieId's
+filter(movies, movies$title == "War of the Worlds (2005)")
+
+#what to do with duplicates
+```
+
+```{r}
+Ratings <- left_join(ratings, movies) 
+filter(Ratings, Ratings$title == "War of the Worlds (2005)")
+```
+
+Creating user frequency
+```{r}
+users_frq <- ratings %>% group_by(userId) %>% summarize(count = n()) %>% arrange(desc(count))  #number of ratings per user
+
+user_no <- function(n,users_frq, seed){
+  # n is the number of users to sample depending on price bracket
+  # users_frq is the table of users
+  # seed number to repeat results
+  set.seed(seed)
+  sample_n(users_frq, size = n, replace = F) %>% select(userId)
+}
+
+Users10 <- user_no(10, users_frq, 25)
+nrow(users_frq)
+```

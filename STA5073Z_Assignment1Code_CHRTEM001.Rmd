@@ -1,0 +1,551 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+dir.create("data")
+download.file(
+  url = "http://files.grouplens.org/datasets/movielens/ml-latest.zip", 
+  destfile = "data/ml-latest.zip"
+)
+unzip("data/ml-latest.zip", exdir = "data")
+```
+
+```{r}
+# read in the csv files
+movies <- read.csv("data/ml-latest/movies.csv")  # movie info: title and genre
+ratings <- read.csv("data/ml-latest/ratings.csv") # user ratings for each movie
+tags <- read.csv("data/ml-latest/tags.csv") # additional user reviews ("tag")
+links <- read.csv("data/ml-latest/links.csv") # lookup for imdb movie IDs
+
+# save as .RData
+save(links, movies, ratings, tags, file = "data/movielens.RData")
+```
+
+Loading data from a RData file, that is smaller in size than the original csv files
+```{r}
+load("data/movielens.RData")
+```
+
+Loading necessary libraries
+```{r}
+library(tidyverse)
+library(NNLM)
+library(tictoc)
+```
+
+Looking at the data
+```{r}
+glimpse(ratings)
+```
+
+Looking at the data contd.
+```{r}
+length(unique(ratings$userId))
+unique(ratings$rating) #checking possible values of ratings
+length(unique(movies$movieId))
+length(unique(movies$title))
+```
+
+From the length of the unique "movieId" and "title" above, we see that some titles are associated with more than one movieId. There are 78 such duplicates, It was decided that the duplicates would be removed. This is executed in the chuck below.
+```{r}
+movies <- distinct(movies, title, .keep_all = T)
+```
+
+Creating a more detailed Ratings dataset, by including movie title and genre
+```{r}
+Ratings <- left_join(ratings, movies) 
+Ratings <- na.omit(Ratings)
+Ratings
+```
+
+This functions creates a subset of the movie dataset, using the required number of users and movies, and a specified seed for replication. 
+```{r}
+Data_Subset <- function(data, no_of_users, no_of_movies, seed){
+  #data - the dataframe of the movie ratings
+  #no_of_users - scalar value, the number of users to be sampled at random from the full dataset
+  #no_of_movies - scalar value, the number of movies to sample. The movies shall be sampled in descending order to gain as much information as possible
+  #seed - the set seed needed for reproducing results. 
+  
+  #movies_frq is the total number of ratings for each movie received, arranging in descending order to capture the top rated movies for the subset
+  movies_frq <- data %>% group_by(movieId) %>% summarize(count = n()) %>% arrange(desc(count)) 
+  Movies <- movies_frq$movieId[1:no_of_movies]
+  
+  #users_frq is the total number of ratings for each user gave, which will be sampled randomly according to the specified seed.
+  users_frq <- data %>% group_by(userId) %>% summarize(count = n()) %>% arrange(desc(count))
+  set.seed(seed)
+  Users <- sample_n(users_frq, size = no_of_users, replace = F) %>% select(userId)
+  
+  
+  Data_SubSet <- data %>% filter(userId %in% (Users$userId), movieId %in% Movies) %>% droplevels()
+  return(Data_SubSet)
+}
+```
+
+Cosine similarity function
+```{r}
+tic("Cosine_Sim1")
+cosine_sim <- function(a){
+  #a - the matrix on which cosine similarity will be performed on. 
+  #b - the output matrix of the cosine similarity function
+  
+  a <- ifelse(is.na(a), 0, a)
+  b <- tcrossprod(a/sqrt(rowSums(a^2))) #cosine similarity formula
+  diag(b) <- 0   #setting the diagonals to 0, as the diagonals are a similarity comparison to themselves
+  row.names(b) <- row.names(a) #copying the names from the original matrix to label the new matrix
+  colnames(b) <- row.names(a)
+  
+  return(as.matrix(b))
+}
+
+toc()
+```
+
+User-based and by extension item based prediction process. This is specifically to predict the ratings for the values in the test set to calculate the RMSE
+```{r}
+  UB_predicted <- NULL
+
+  for (i in 1:length(test$userId)){
+    user <- as.character(test$userId[i])   #selecting the user from the test set to predict rating for
+    title <- as.character(test$title[i])   #selecting the corresponding movie from the test set
+    sim <- user_sim[user,]      #the selected user's similarity vector
+    rate <- Movie_rating[,title]   #the ratings for the corresponding movie
+    
+    #sim_to_user then combines the similarity vector and the available ratings, while omitting all users who haven't rated the movie
+    sim_to_user <- as.data.frame(na.omit(cbind(sim, rate))) 
+    scaled_sim <- sim_to_user$sim/sum(sim_to_user$sim)   #this scales the similarity values to sum up to 1. 
+    sim_to_user <- cbind(sim_to_user,scaled_sim)
+    
+    #multiplying the ratings and the scaled similarity values gives a rating prediction between 1 and 5 
+    UB_predicted[i] <- crossprod(sim_to_user$rate,scaled_sim)  
+    
+    #In the event, that a user is not similar to any of the users who have rated the movie, the average rating from the other users is given
+    UB_predicted[i] <- ifelse(is.nan(UB_predicted[i]) == T, mean(sim_to_user$rate), UB_predicted[i])
+  }
+```
+
+
+#Matrix Factorization with bias and Regularisation
+```{r}
+MF_TestPrediction <- function(Movie_rating, test){
+  #Movie_rating - the spread data matrix of movie ratings
+  #test - vector  of the userIds and Movie Titles set aside to form the test set
+  
+  
+  #H0 and W0 are the bias matrices, that are set to an initial value of 1.
+init = list(
+  H0 = matrix(1, nrow = 1, ncol = ncol(Movie_rating)),
+  W0 = matrix(1, nrow = nrow(Movie_rating), ncol = 1)
+)
+
+# matrix factorization with bias included
+decomp <- nnmf(A = Movie_rating,
+               method = "scd",       #decomposition method is sequential coordinate-wise descent
+               k = 3,
+               alpha = c(0.001,0,0),  #L2 Regularisation on W 
+               beta = c(0.001,0,0),   #L2 Regularisation on H
+               init = init, # bias terms
+               max.iter = 10000) #Maximum number of iterations
+
+# results
+mf_observed <- decomp$W %*% decomp$H  #predicted values of all the movie & user combinations
+
+#This function extracts the predictions of the test set observations.
+Prediction <- function(i){ 
+  #i is a counter
+  user <- as.character(test$userId[i])
+  title <- as.character(test$title[i])
+  Predicted <- NULL
+  
+  Predicted[i] <- mf_observed[user, title] #pulls predictions from the mf_observed matrix of the test set
+  Predicted[i] <- ifelse(Predicted[i] < 1, 1, Predicted[i]) #if the prediction is less than 1, if should be limited to 1
+  Predicted[i] <- ifelse(Predicted[i] > 5 , 5, Predicted[i]) #if the prediction is greater than 5, if should be limited to 5
+}
+
+
+r = nrow(test)
+MF_Predicted <- sapply(1:r, Prediction)  #this runs multiple values through the prediction function
+ 
+
+return(MF_Predicted)
+}
+```
+
+Fulltest is the function created to run all three prediction methods, combine them to attain an ensembled result, and only output the final RMSE. 
+
+NB: the model predicting the all movie ratings for all users, can be found at the end of this file. 
+```{r}
+Fulltest <- function(seed, no_of_users, data, no_of_movies){
+  #seed - set seed to ensure reproducibility
+  #no_of_users - scalar value, the number of users to be sampled at random from the full dataset
+  #no_of_movies - scalar value, the number of movies to sample. The movies shall be sampled in descending order to gain as much information as possible
+  #data - the dataframe of the movie ratings
+
+  Reduced_Ratings <- Data_Subset(data, no_of_users, no_of_movies, seed)
+  
+  #Creating the test set
+  set.seed(seed) #Using the same seed for all iterations
+  testobs <- sample(nrow(Reduced_Ratings),trunc(length(Reduced_Ratings$rating)*0.1)) #sampling 10% of points to form the test set
+  
+  test <- Reduced_Ratings[testobs,]  #saving the test set and its values
+  
+  Reduced_Ratings$rating[testobs] <- NA  # setting the test set rating values to NA in the training set for the model to predict
+  
+  #spreading the ratings into a wide matrix of users and movies
+  Movie_rating <- Reduced_Ratings %>% 
+    complete(userId, title) %>% 
+    select(userId, title, rating) %>% 
+    spread(key = title, value = rating)
+  
+  sorted_users <- as.character(unlist(Movie_rating[,1]))
+  Movie_rating <- as.matrix(Movie_rating[,-1])   #removing the first column of userId
+  row.names(Movie_rating) <- sorted_users  #labeling the with the userId
+  
+  user_sim <- cosine_sim(Movie_rating)
+  
+  
+  #User-based filtering method
+  predictedA <- NULL
+
+  for (i in 1:length(test$userId)){
+    user <- as.character(test$userId[i])
+    title <- as.character(test$title[i])
+    sim <- user_sim[user,]
+    rate <- Movie_rating[,title]
+    
+    sim_to_user <- as.data.frame(na.omit(cbind(sim, rate)))
+    scaled_sim <- sim_to_user$sim/sum(sim_to_user$sim)
+    sim_to_user <- cbind(sim_to_user,scaled_sim)
+    predictedA[i] <- crossprod(sim_to_user$rate,scaled_sim)
+    predictedA[i] <- ifelse(is.nan(predictedA[i]) == T, mean(sim_to_user$rate), predictedA[i])
+  }
+  
+  
+  #Item-based filtering method
+  movies_user <- t(Movie_rating)  #transpose the Movie_rating matrix to be used to calculate the similarity between movies
+  movie_sim <- cosine_sim(movies_user) #cosine similarity of movies
+  
+  predictedB <- NULL
+
+
+  for (i in 1:length(test$userId)){
+    user <- as.character(test$userId[i])
+    title <- as.character(test$title[i])
+    sim <- movie_sim[title,]
+    rate <- movies_user[,user]
+    
+    sim_to_movie <- as.data.frame(na.omit(cbind(sim, rate)))
+    scaled_movie_sim <- sim_to_movie$sim/sum(sim_to_movie$sim)
+    sim_to_movie <- cbind(sim_to_movie,scaled_movie_sim)
+    predictedB[i] <- crossprod(sim_to_movie$rate,scaled_movie_sim)
+    predictedB[i] <- ifelse(is.nan(predictedB[i]) == T, mean(sim_to_movie$rate), predictedB[i])
+  }
+  
+  #Matrix Factorization MEthod
+  predictedC <- MF_TestPrediction(Movie_rating, test)
+  
+  #Ensemble Predictions created by averaging the predictions 
+  PredictedD <- apply(cbind(predictedA,predictedB, predictedC), 1, mean)
+  
+  #The RMSE of the final predictions
+  RMSE_PredD <- sqrt(sum((PredictedD - test$rating)^2)/length(test$rating))
+  return(RMSE_PredD) 
+}
+```
+
+A simple test of the function
+```{r}
+tic("test1")
+Fulltest(Ratings, no_of_users = 100, no_of_movies = 1000, seed = 100)
+toc()
+```
+
+
+```{r}
+tic()
+#20 seeds to iterate the function through, for 100 users and 1000 movies 
+seed <- c(1,5,6,90,101,13,15,17,59,21,123,525,24,29,631,43,35,37,69, 73)
+
+accuracy100users1000movies <- sapply(1:20,function(i) Fulltest(Ratings, no_of_users = 100, no_of_movies = 1000, seed = seed[i]))
+accuracy100users1000movies
+toc()
+```
+
+```{r}
+tic()
+seed <- c(1,5,6,90,101,13,15,17,59,21,123,525,24,29,631,43,35,37,69, 73)
+
+accuracy500users1000movies <- sapply(1:20,function(i) Fulltest(Ratings, no_of_users = 500, no_of_movies = 1000, seed = seed[i]))
+accuracy500users1000movies
+toc()
+```
+
+```{r}
+#run again
+tic()
+seed <- c(1,5,6,90,101,13,15,17,59,21,123,525,24,29,631,43,35,37,69, 73)
+
+accuracy1000users1000movies <- sapply(1:20,function(i) Fulltest(Ratings, no_of_users = 1000, no_of_movies = 1000, seed = seed[i]))
+accuracy1000users1000movies
+toc()
+
+#tictoc measures how long a task takes to run. 20 iterations of 1000 users took 703 seconds (or approx. 12 mins). For this reason, only 5 ireations were run for subsequent tests.
+```
+
+```{r}
+tic()
+seed <- c(1,101,525,69,73)
+
+accuracy3000users1000movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 3000, no_of_movies = 1000, seed = seed[i]))
+accuracy3000users1000movies
+toc()
+```
+
+```{r}
+tic()
+seed <- c(1,101,525,69,73)
+
+accuracy5000users1000movies <- sapply(1,function(i) Fulltest(Ratings, no_of_users = 5000, no_of_movies = 1000, seed = seed[i]))
+accuracy5000users1000movies
+toc()
+```
+
+
+```{r}
+#combining the summaries of the different iterations 
+Range_for_1000movies <- cbind(summary(accuracy100users1000movies),summary(accuracy500users1000movies),summary(accuracy1000users1000movies),summary(accuracy3000users1000movies),summary(accuracy5000users1000movies))
+colnames(Range_for_1000movies) <- c("100", "500", "1000", "3000", "5000")
+
+#boxplots of the different user sizes
+boxplot(Range_for_1000movies, xlab = "No of Users", ylab = "RMSE", main = "Boxplots of different user counts for 1000 Movies",col = c("blue", "red", "green", "violet" , "yellow" ))
+```
+
+```{r}
+x_axis = c(100, 500, 1000, 3000, 5000)
+plot(x= x_axis, y = Range_for_1000movies[4,], type = "b", pch = 19, ylim = c(0.8, 1.2), lwd = 2, ylab = "RMSE", xlab = "No. of Users", main = "RMSE against the Number of User")
+#points(Range_for_1000movies[4,])
+lines(x= x_axis, y =Range_for_1000movies[1,], col = "darkgreen", lty = 2)
+lines(x= x_axis, y =Range_for_1000movies[5,], col = "firebrick", lty = 2)
+axis(1, at = c(1, 2, 3, 4, 5) ,labels=colnames(Range_for_1000movies))
+# Add a legend
+legend("topright", inset=.02, legend=c("Maximum", "Mean", "Minimum"), box.lty=0,
+       col=c("firebrick", "black","darkgreen"), lty= c(2,1,2), lwd= c(1,2,1), cex=0.8, bg='lightblue')
+```
+It was decided to change the number of movies used. The sizes used were 500, 100 and 2000
+```{r}
+tic()
+seed <- c(1,101,525,69, 73)
+
+accuracy100users500movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 100, no_of_movies = 500, seed = seed[i]))
+accuracy500users500movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 500, no_of_movies = 500, seed = seed[i]))
+accuracy1000users500movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 1000, no_of_movies = 500, seed = seed[i]))
+accuracy3000users500movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 3000, no_of_movies = 500, seed = seed[i]))
+accuracy5000users500movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 5000, no_of_movies = 500, seed = seed[i]))
+toc()
+```
+
+Saving the results recorded so far
+```{r}
+save(accuracy100users1000movies, accuracy500users1000movies, accuracy1000users1000movies, accuracy3000users1000movies, accuracy5000users1000movies, accuracy100users500movies, accuracy500users500movies, accuracy1000users500movies, accuracy3000users500movies, accuracy5000users500movies, Range_for_1000movies,  file = "data/Results.RData")
+load("data/Results.RData")
+```
+
+Plotting the results of using 500 movies
+```{r}
+Range_for_500movies <- cbind(summary(accuracy100users500movies),summary(accuracy500users500movies),summary(accuracy1000users500movies),summary(accuracy3000users500movies),summary(accuracy5000users500movies))
+colnames(Range_for_500movies) <- c("100", "500", "1000", "3000", "5000")
+boxplot(Range_for_500movies, xlab = "No of Users", ylab = "RMSE", main = "Boxplots of different user counts for 500 Movies",col = c("blue", "red", "green", "violet" , "yellow" ))
+```
+
+```{r}
+x_axis = c(100, 500, 1000, 3000, 5000)
+plot(x= x_axis, y = Range_for_500movies[4,], type = "b", pch = 19, ylim = c(0.8, 1.1), lwd = 2, ylab = "RMSE", xlab = "No. of Users", main = "RMSE against the Number of User for 500 movies")
+lines(x= x_axis, y =Range_for_500movies[1,], col = "blue", lty = 2)
+lines(x= x_axis, y =Range_for_500movies[5,], col = "red", lty = 2)
+axis(1, at = c(1, 2, 3, 4, 5) ,labels=colnames(Range_for_500movies))
+# Add a legend
+legend("topright", inset=.02, legend=c("Maximum", "Mean", "Minimum"), box.lty=0,
+       col=c("red", "black","blue"), lty= c(2,1,2), lwd= c(1,2,1), cex=0.8, bg='lightblue')
+```
+
+Sampling users, with 100 movies
+```{r}
+tic()
+seed <- c(1,101,525,69, 73)
+
+accuracy100users100movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 100, no_of_movies = 100, seed = seed[i]))
+accuracy500users100movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 500, no_of_movies = 100, seed = seed[i]))
+accuracy1000users100movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 1000, no_of_movies = 100, seed = seed[i]))
+accuracy3000users100movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 3000, no_of_movies = 100, seed = seed[i]))
+accuracy5000users100movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 5000, no_of_movies = 100, seed = seed[i]))
+toc()
+```
+
+```{r}
+Range_for_100movies <- cbind(summary(accuracy100users100movies),summary(accuracy500users100movies),summary(accuracy1000users100movies),summary(accuracy3000users100movies),summary(accuracy5000users100movies))
+colnames(Range_for_100movies) <- c("100", "500", "1000", "3000", "5000")
+boxplot(Range_for_100movies, xlab = "No of Users", col = c("blue", "red", "green", "violet" , "yellow" ))
+```
+
+Sampling users, with 2000 movies
+```{r}
+seed <- c(1,101,525,69, 73)
+
+accuracy100users2000movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 100, no_of_movies = 2000, seed = seed[i]))
+accuracy500users2000movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 500, no_of_movies = 2000, seed = seed[i]))
+accuracy1000users2000movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 1000, no_of_movies = 2000, seed = seed[i]))
+accuracy3000users2000movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 3000, no_of_movies = 2000, seed = seed[i]))
+accuracy5000users2000movies <- sapply(1:5,function(i) Fulltest(Ratings, no_of_users = 5000, no_of_movies = 2000, seed = seed[i]))
+```
+
+```{r}
+Range_for_2000movies <- cbind(summary(accuracy100users2000movies),summary(accuracy500users2000movies),summary(accuracy1000users2000movies),summary(accuracy3000users2000movies),summary(accuracy5000users2000movies))
+colnames(Range_for_2000movies) <- c("100", "500", "1000", "3000", "5000")
+boxplot(Range_for_2000movies, xlab = "No of Users", col = c("blue", "red", "green", "violet" , "yellow" ))
+```
+
+```{r}
+x_axis = c(100, 500, 1000, 3000, 5000)
+plot(x= x_axis, y = Range_for_2000movies[4,], type = "b", pch = 19, ylim = c(0.82, 1.5), lwd = 2, ylab = "RMSE", xlab = "No. of Users", main = "RMSE against the Number of User for 2000 movies")
+lines(x= x_axis, y =Range_for_2000movies[1,], col = "blue", lty = 2)
+lines(x= x_axis, y =Range_for_2000movies[5,], col = "red", lty = 2)
+axis(1, at = c(1, 2, 3, 4, 5) ,labels=colnames(Range_for_2000movies))
+# Add a legend
+legend("topright", inset=.02, legend=c("Maximum", "Mean", "Minimum"), box.lty=0,
+       col=c("red", "black","blue"), lty= c(2,1,2), lwd= c(1,2,1), cex=0.8, bg='lightblue')
+```
+
+Checking the progression of the RMSE with respect to the number of movies sampled.The number of movies sampled were 100, 500, 1000 and 2000.
+```{r}
+RMSE_vs_Movies <- cbind(Range_for_100movies[4,], Range_for_500movies[4,] ,Range_for_1000movies[4,], Range_for_2000movies[4,])
+
+colindex = c("blue", "red", "green", "violet")
+
+#plot of all the different user sizes
+plot(x = c(100, 500, 1000, 2000), y = RMSE_vs_Movies[5,], type = "l", ylim = c(0.83,1.5), col = "yellow", main = "RMSE against the Number of Movies", xlab = "Number of Movies", ylab = "RMSE")
+for (i in 1:4) {
+  lines(x = c(100, 500, 1000, 2000), y = RMSE_vs_Movies[i,], col = colindex[i] )
+}
+
+legend("topleft", inset=.02, legend=c("100 users","500 users","1000 users","3000 users","5000 users"), box.lty=1,
+       col=c(colindex, "yellow"), lty= 1, cex=0.8)
+
+
+#plot of all the different user sizes excluding 100 users for a closer look
+plot(x = c(100, 500, 1000, 2000), y = RMSE_vs_Movies[5,], type = "l", ylim = c(0.83,0.9), xlim = c(100,2000), col = "yellow", main = "RMSE against the Number of Movies", xlab = "Number of Movies", ylab = "RMSE")
+for (i in 2:4) {
+  lines(x = c(100, 500, 1000, 2000), y = RMSE_vs_Movies[i,], col = colindex[i] )
+}
+
+legend("topleft", inset=.02, legend=c("500 users","1000 users","3000 users","5000 users"), box.lty=1,
+       col=c(colindex[2:4], "yellow"), lty= 1, cex=0.8)
+```
+
+Full prediction of all movies
+```{r}
+#Editing the matrix factorization formula to output the full matrix
+MF_Prediction <- function(Movie_rating){
+  #Movie_rating - the spread data matrix of movie ratings
+  
+  #H0 and W0 are the bias matrices, that are set to an initial value of 1.
+init = list(
+  H0 = matrix(1, nrow = 1, ncol = ncol(Movie_rating)),
+  W0 = matrix(1, nrow = nrow(Movie_rating), ncol = 1)
+)
+
+# matrix factorization with bias included
+decomp <- nnmf(A = Movie_rating,
+               method = "scd",       #decomposition method is sequential coordinate-wise descent
+               k = 3,
+               alpha = c(0.001,0,0),  #L2 Regularisation on W 
+               beta = c(0.001,0,0),   #L2 Regularisation on H
+               init = init, # bias terms
+               max.iter = 10000) #Maximum number of iterations
+
+# results
+MF_Predicted <- decomp$W %*% decomp$H  #predicted values of all the movie & user combinations
+ifelse(MF_Predicted < 1, 1, MF_Predicted)
+ifelse(MF_Predicted > 5, 5, MF_Predicted)
+
+return(MF_Predicted)
+}
+
+Fullprediction <- function(seed, no_of_users, data, no_of_movies){
+  #seed - set seed to ensure reproducibility
+  #no_of_users - scalar value, the number of users to be sampled at random from the full dataset
+  #no_of_movies - scalar value, the number of movies to sample. The movies shall be sampled in descending order to gain as much information as possible
+  #data - the dataframe of the movie ratings
+
+  Reduced_Ratings <- Data_Subset(data, no_of_users, no_of_movies, seed)
+  
+  #No need for a test set split
+  
+  #spreading the ratings into a wide matrix of users and movies
+  Movie_rating <- Reduced_Ratings %>% 
+    complete(userId, title) %>% 
+    select(userId, title, rating) %>% 
+    spread(key = title, value = rating)
+  
+  sorted_users <- as.character(unlist(Movie_rating[,1]))
+  Movie_rating <- as.matrix(Movie_rating[,-1])   #removing the first column of userId
+  row.names(Movie_rating) <- sorted_users  #labeling the with the userId
+  
+  user_sim <- cosine_sim(Movie_rating)
+  
+  
+  #User-based filtering method
+  FullPredictionA <- matrix(0, nrow = nrow(Movie_rating), ncol = ncol(Movie_rating))
+  
+  for (i in 1:nrow(Movie_rating)){
+    for ( j in 1:ncol(Movie_rating)){
+  
+      sim <- user_sim[i,]
+      rate <- Movie_rating[,j]
+      
+      sim_to_user <- as.data.frame(na.omit(cbind(sim, rate)))
+      scaled_sim <- sim_to_user$sim/sum(sim_to_user$sim)
+      sim_to_user <- cbind(sim_to_user,scaled_sim)
+      FullPredictionA[i,j] <- crossprod(sim_to_user$rate,scaled_sim)
+      FullPredictionA[i,j] <- ifelse(is.nan(FullPredictionA[i,j]) == T, mean(sim_to_user$rate), FullPredictionA[i,j])
+    }
+  }
+
+  #Item-based filtering method
+  movies_user <- t(Movie_rating)  #transpose the Movie_rating matrix to be used to calculate the similarity between movies
+  movie_sim <- cosine_sim(movies_user) #cosine similarity of movies
+  
+  FullPredictionB <- matrix(0, nrow = nrow(movies_user), ncol = ncol(movies_user))
+  
+  for (i in 1:nrow(movies_user)){
+    for ( j in 1:ncol(movies_user)){
+  
+      sim <- movie_sim[i,]
+      rate <- movies_user[,j]
+      
+      sim_to_movie <- as.data.frame(na.omit(cbind(sim, rate)))
+      scaled_movie_sim <- sim_to_movie$sim/sum(sim_to_movie$sim)
+      sim_to_movie <- cbind(sim_to_movie,scaled_movie_sim)
+      FullPredictionB[i,j] <- crossprod(sim_to_movie$rate,scaled_movie_sim)
+      FullPredictionB[i,j] <- ifelse(is.nan(FullPredictionB[i,j]) == T, mean(sim_to_movie$rate), FullPredictionB[i,j])
+    }
+  }
+  FullPredictionB <- t(FullPredictionB)
+  
+  #Matrix Factorization Method
+  FullPredictionC <- MF_Prediction(Movie_rating)
+  
+  #Ensemble Predictions
+  FullPredictionD <- (FullPredictionA + FullPredictionBB + FullPredictionC)/3
+  
+  return(FullPredictionD) 
+}
+```
+
+An example of how the model would work
+```{r}
+tic()
+Fullprediction(seed = 25, no_of_users = 10, no_of_movies = 10, data = Ratings)
+toc()
+```
+
